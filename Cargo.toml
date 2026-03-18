@@ -44,7 +44,6 @@ nix = { version = "0.31", features = ["signal", "mman"] }
 bytes = "1.11"
 data-encoding = "2.6"
 md5 = "0.8"
-num_enum = "0.7"
 derive_more = { version = "2.1", features = ["display"] }
 pin-project-lite = "0.2"
 futures = "0.3"

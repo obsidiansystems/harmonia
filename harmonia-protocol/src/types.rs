@@ -6,7 +6,6 @@ use std::pin::Pin;
 use bstr::ByteSlice;
 use bytes::Bytes;
 use futures::Stream;
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 use thiserror::Error;
 use tokio::io::AsyncBufRead;
 
@@ -79,8 +78,6 @@ impl Default for ClientOptions {
     PartialOrd,
     Ord,
     Hash,
-    TryFromPrimitive,
-    IntoPrimitive,
     NixDeserialize,
     NixSerialize,
 )]
@@ -90,6 +87,24 @@ pub enum TrustLevel {
     Unknown = 0,
     Trusted = 1,
     NotTrusted = 2,
+}
+
+impl TryFrom<u64> for TrustLevel {
+    type Error = u64;
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Unknown),
+            1 => Ok(Self::Trusted),
+            2 => Ok(Self::NotTrusted),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<TrustLevel> for u64 {
+    fn from(value: TrustLevel) -> u64 {
+        value as u64
+    }
 }
 
 pub type DaemonResult<T> = Result<T, DaemonError>;

@@ -9,7 +9,6 @@ use std::str::FromStr;
 use std::str::from_utf8;
 use std::time::Duration;
 
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 #[cfg(test)]
 use test_strategy::Arbitrary;
 use tracing::{Span, debug_span};
@@ -96,8 +95,6 @@ impl fmt::Display for BaseStorePath {
     PartialOrd,
     Ord,
     Hash,
-    TryFromPrimitive,
-    IntoPrimitive,
     NixDeserialize,
     NixSerialize,
 )]
@@ -106,6 +103,23 @@ impl fmt::Display for BaseStorePath {
 pub enum FileIngestionMethod {
     Flat = 0,
     Recursive = 1,
+}
+
+impl TryFrom<u16> for FileIngestionMethod {
+    type Error = u16;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Flat),
+            1 => Ok(Self::Recursive),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<FileIngestionMethod> for u16 {
+    fn from(value: FileIngestionMethod) -> u16 {
+        value as u16
+    }
 }
 
 #[derive(
@@ -117,8 +131,6 @@ pub enum FileIngestionMethod {
     PartialOrd,
     Ord,
     Hash,
-    TryFromPrimitive,
-    IntoPrimitive,
     NixDeserialize,
     NixSerialize,
 )]
@@ -130,6 +142,24 @@ pub enum BuildMode {
     Check = 2,
 }
 
+impl TryFrom<u16> for BuildMode {
+    type Error = u16;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Normal),
+            1 => Ok(Self::Repair),
+            2 => Ok(Self::Check),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<BuildMode> for u16 {
+    fn from(value: BuildMode) -> u16 {
+        value as u16
+    }
+}
+
 #[derive(
     Debug,
     Clone,
@@ -139,8 +169,6 @@ pub enum BuildMode {
     PartialOrd,
     Ord,
     Hash,
-    TryFromPrimitive,
-    IntoPrimitive,
     Default,
     NixDeserialize,
     NixSerialize,
@@ -153,6 +181,25 @@ pub enum GCAction {
     ReturnDead = 1,
     DeleteDead = 2,
     DeleteSpecific = 3,
+}
+
+impl TryFrom<u16> for GCAction {
+    type Error = u16;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::ReturnLive),
+            1 => Ok(Self::ReturnDead),
+            2 => Ok(Self::DeleteDead),
+            3 => Ok(Self::DeleteSpecific),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<GCAction> for u16 {
+    fn from(value: GCAction) -> u16 {
+        value as u16
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, NixDeserialize, NixSerialize)]

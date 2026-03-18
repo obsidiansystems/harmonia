@@ -5,7 +5,6 @@
 // Logging types for the Nix daemon protocol.
 
 use bytes::Bytes;
-use num_enum::{FromPrimitive, IntoPrimitive, TryFromPrimitive};
 use serde::{Deserialize, Serialize};
 #[cfg(any(test, feature = "test"))]
 use test_strategy::Arbitrary;
@@ -35,8 +34,6 @@ where
     PartialOrd,
     Ord,
     Hash,
-    FromPrimitive,
-    IntoPrimitive,
     Default,
     Serialize,
     Deserialize,
@@ -53,8 +50,28 @@ pub enum Verbosity {
     Talkative = 4,
     Chatty = 5,
     Debug = 6,
-    #[catch_all]
     Vomit = 7,
+}
+
+impl From<u16> for Verbosity {
+    fn from(value: u16) -> Self {
+        match value {
+            0 => Self::Error,
+            1 => Self::Warn,
+            2 => Self::Notice,
+            3 => Self::Info,
+            4 => Self::Talkative,
+            5 => Self::Chatty,
+            6 => Self::Debug,
+            _ => Self::Vomit,
+        }
+    }
+}
+
+impl From<Verbosity> for u16 {
+    fn from(value: Verbosity) -> u16 {
+        value as u16
+    }
 }
 
 #[derive(
@@ -66,8 +83,6 @@ pub enum Verbosity {
     PartialOrd,
     Ord,
     Hash,
-    TryFromPrimitive,
-    IntoPrimitive,
     Serialize,
     Deserialize,
 )]
@@ -91,6 +106,35 @@ pub enum ActivityType {
     FetchTree = 112,
 }
 
+impl TryFrom<u16> for ActivityType {
+    type Error = u16;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Unknown),
+            100 => Ok(Self::CopyPath),
+            101 => Ok(Self::FileTransfer),
+            102 => Ok(Self::Realise),
+            103 => Ok(Self::CopyPaths),
+            104 => Ok(Self::Builds),
+            105 => Ok(Self::Build),
+            106 => Ok(Self::OptimiseStore),
+            107 => Ok(Self::VerifyPaths),
+            108 => Ok(Self::Substitute),
+            109 => Ok(Self::QueryPathInfo),
+            110 => Ok(Self::PostBuildHook),
+            111 => Ok(Self::BuildWaiting),
+            112 => Ok(Self::FetchTree),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<ActivityType> for u16 {
+    fn from(value: ActivityType) -> u16 {
+        value as u16
+    }
+}
+
 #[derive(
     Debug,
     Clone,
@@ -100,8 +144,6 @@ pub enum ActivityType {
     PartialOrd,
     Ord,
     Hash,
-    TryFromPrimitive,
-    IntoPrimitive,
     Serialize,
     Deserialize,
 )]
@@ -118,6 +160,30 @@ pub enum ResultType {
     SetExpected = 106,
     PostBuildLogLine = 107,
     FetchStatus = 108,
+}
+
+impl TryFrom<u16> for ResultType {
+    type Error = u16;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            100 => Ok(Self::FileLinked),
+            101 => Ok(Self::BuildLogLine),
+            102 => Ok(Self::UntrustedPath),
+            103 => Ok(Self::CorruptedPath),
+            104 => Ok(Self::SetPhase),
+            105 => Ok(Self::Progress),
+            106 => Ok(Self::SetExpected),
+            107 => Ok(Self::PostBuildLogLine),
+            108 => Ok(Self::FetchStatus),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<ResultType> for u16 {
+    fn from(value: ResultType) -> u16 {
+        value as u16
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -203,13 +269,28 @@ pub struct ActivityResult {
     pub result_type: ResultType,
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, TryFromPrimitive, IntoPrimitive,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u16)]
 pub enum FieldType {
     Int = 0,
     String = 1,
+}
+
+impl TryFrom<u16> for FieldType {
+    type Error = u16;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Int),
+            1 => Ok(Self::String),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<FieldType> for u16 {
+    fn from(value: FieldType) -> u16 {
+        value as u16
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

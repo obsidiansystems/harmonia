@@ -11,7 +11,6 @@ use async_stream::stream;
 use bytes::Bytes;
 use futures::Stream;
 use futures::stream::{Empty, empty};
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::oneshot;
@@ -45,8 +44,6 @@ pub const STDERR_RESULT: u64 = 0x52534c54; // 'RSLT' in ASCII
     PartialOrd,
     Ord,
     Hash,
-    TryFromPrimitive,
-    IntoPrimitive,
     NixDeserialize,
     NixSerialize,
 )]
@@ -61,6 +58,29 @@ pub enum RawLogMessageType {
     StartActivity = STDERR_START_ACTIVITY,
     StopActivity = STDERR_STOP_ACTIVITY,
     Result = STDERR_RESULT,
+}
+
+impl TryFrom<u64> for RawLogMessageType {
+    type Error = u64;
+    fn try_from(value: u64) -> Result<Self, <Self as TryFrom<u64>>::Error> {
+        match value {
+            STDERR_LAST => Ok(Self::Last),
+            STDERR_ERROR => Ok(Self::Error),
+            STDERR_NEXT => Ok(Self::Next),
+            STDERR_READ => Ok(Self::Read),
+            STDERR_WRITE => Ok(Self::Write),
+            STDERR_START_ACTIVITY => Ok(Self::StartActivity),
+            STDERR_STOP_ACTIVITY => Ok(Self::StopActivity),
+            STDERR_RESULT => Ok(Self::Result),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<RawLogMessageType> for u64 {
+    fn from(value: RawLogMessageType) -> u64 {
+        value as u64
+    }
 }
 
 #[derive(Debug)]

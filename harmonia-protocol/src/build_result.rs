@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
@@ -28,8 +27,6 @@ use harmonia_store_core::realisation::UnkeyedRealisation;
     PartialOrd,
     Ord,
     Hash,
-    TryFromPrimitive,
-    IntoPrimitive,
     Serialize,
     Deserialize,
 )]
@@ -39,6 +36,25 @@ pub enum SuccessStatus {
     Substituted = 1,
     AlreadyValid = 2,
     ResolvesToAlreadyValid = 13,
+}
+
+impl TryFrom<u16> for SuccessStatus {
+    type Error = u16;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Built),
+            1 => Ok(Self::Substituted),
+            2 => Ok(Self::AlreadyValid),
+            13 => Ok(Self::ResolvesToAlreadyValid),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<SuccessStatus> for u16 {
+    fn from(value: SuccessStatus) -> u16 {
+        value as u16
+    }
 }
 
 /// Failure status values for BuildResult.
@@ -53,8 +69,6 @@ pub enum SuccessStatus {
     PartialOrd,
     Ord,
     Hash,
-    TryFromPrimitive,
-    IntoPrimitive,
     Serialize,
     Deserialize,
 )]
@@ -73,6 +87,32 @@ pub enum FailureStatus {
     LogLimitExceeded = 11,
     NotDeterministic = 12,
     NoSubstituters = 14,
+}
+
+impl TryFrom<u16> for FailureStatus {
+    type Error = u16;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            3 => Ok(Self::PermanentFailure),
+            4 => Ok(Self::InputRejected),
+            5 => Ok(Self::OutputRejected),
+            6 => Ok(Self::TransientFailure),
+            7 => Ok(Self::CachedFailure),
+            8 => Ok(Self::TimedOut),
+            9 => Ok(Self::MiscFailure),
+            10 => Ok(Self::DependencyFailed),
+            11 => Ok(Self::LogLimitExceeded),
+            12 => Ok(Self::NotDeterministic),
+            14 => Ok(Self::NoSubstituters),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<FailureStatus> for u16 {
+    fn from(value: FailureStatus) -> u16 {
+        value as u16
+    }
 }
 
 /// Successful build result data.
