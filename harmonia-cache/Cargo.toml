@@ -13,23 +13,25 @@ name = "harmonia-cache"
 path = "src/main.rs"
 
 [dependencies]
-actix-web = { version = "4", default-features = false, features = ["macros", "compress-zstd", "cookies", "rustls-0_23"] }
+axum = { version = "0.8", features = ["tokio", "json"] }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+tower-http = { version = "0.6", features = ["compression-zstd", "fs"] }
+tower = "0.5"
+http-body = "1"
+pin-project-lite = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"
-actix-files = "0.6.10"
 log = { workspace = true }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "1.0"
-mime = "0.3"
 tokio = { workspace = true }
 http-range = "0.1"
 askama_escape = "0.15.4"
 percent-encoding = "2.3.2"
 thiserror = { workspace = true }
-tempfile = "3.26"
 url = "2.5.7"
 async-compression = { version = "0.4.41", features = ["tokio", "bzip2"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
@@ -44,6 +46,7 @@ prometheus = { workspace = true }
 [dev-dependencies]
 harmonia-utils-test = { version = "0.0.0-alpha.0" }
 nix = { workspace = true }
+tempfile = "3.26"
 tokio = { workspace = true, features = ["process"] }
 
 [lints]

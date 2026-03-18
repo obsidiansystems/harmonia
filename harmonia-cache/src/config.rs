@@ -44,6 +44,7 @@ pub(crate) struct Config {
     #[serde(default = "default_workers")]
     pub(crate) workers: usize,
     #[serde(default = "default_connection_rate")]
+    #[allow(dead_code)] // Kept for config file compatibility
     pub(crate) max_connection_rate: usize,
     #[serde(default = "default_priority")]
     pub(crate) priority: usize,

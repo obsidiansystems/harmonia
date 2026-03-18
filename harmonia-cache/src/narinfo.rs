@@ -1,18 +1,15 @@
 use crate::error::{CacheError, NarInfoError, Result, StoreError};
-use actix_web::{HttpResponse, http, web};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use harmonia_store_core::store_path::StorePath;
 use harmonia_store_remote::DaemonStore;
 use harmonia_utils_hash::fmt::CommonHash;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::config::Config;
-use crate::{cache_control_max_age_1d, nixhash, some_or_404};
+use crate::{AppState, cache_control_max_age_1d, nixhash, some_or_404};
 use harmonia_store_core::signature::{SecretKey, fingerprint_path};
-
-#[derive(Debug, Deserialize)]
-pub struct Param {
-    json: Option<String>,
-}
 
 #[derive(Debug, Serialize)]
 struct NarInfo {
@@ -32,9 +29,9 @@ async fn query_narinfo(
     store_path: &StorePath,
     hash: &str,
     sign_keys: &[SecretKey],
-    settings: &web::Data<Config>,
+    config: &Config,
 ) -> Result<Option<NarInfo>> {
-    let mut guard = settings.store.acquire().await?;
+    let mut guard = config.store.acquire().await?;
 
     let path_info = match guard
         .client()
@@ -193,14 +190,13 @@ fn format_narinfo_txt(narinfo: &NarInfo) -> Vec<u8> {
 }
 
 pub(crate) async fn get(
-    hash: web::Path<String>,
-    param: web::Query<Param>,
-    settings: web::Data<Config>,
+    State(state): State<AppState>,
+    axum::extract::Path(hash): axum::extract::Path<String>,
+    query: Option<String>,
 ) -> crate::ServerResult {
-    let hash = hash.into_inner();
     let real_store_path =
         some_or_404!(
-            nixhash(&settings, hash.as_bytes())
+            nixhash(&state, hash.as_bytes())
                 .await
                 .map_err(|e| CacheError::from(NarInfoError::QueryFailed {
                     reason: format!("Could not query nar hash in database: {e}"),
@@ -208,36 +204,69 @@ pub(crate) async fn get(
         );
 
     // Convert real store path to virtual store path
-    let store_path = settings.store.to_virtual_path(&real_store_path);
+    let store_path = state.config.store.to_virtual_path(&real_store_path);
 
     let narinfo = match query_narinfo(
-        settings.store.virtual_store(),
+        state.config.store.virtual_store(),
         &store_path,
         &hash,
-        &settings.secret_keys,
-        &settings,
+        &state.config.secret_keys,
+        &state.config,
     )
     .await?
     {
         Some(narinfo) => narinfo,
         None => {
-            return Ok(HttpResponse::NotFound()
-                .insert_header(cache_control_max_age_1d())
-                .body("missed hash"));
+            return Ok((
+                StatusCode::NOT_FOUND,
+                [(
+                    axum::http::header::CACHE_CONTROL,
+                    cache_control_max_age_1d().as_str(),
+                )],
+                "missed hash",
+            )
+                .into_response());
         }
     };
 
-    if param.json.is_some() {
-        Ok(HttpResponse::Ok()
-            .insert_header(cache_control_max_age_1d())
-            .json(narinfo))
+    // Parse query string for json parameter
+    let wants_json = query.as_ref().map(|q| q.contains("json")).unwrap_or(false);
+
+    if wants_json {
+        Ok((
+            StatusCode::OK,
+            [
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    cache_control_max_age_1d(),
+                ),
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/json".to_string(),
+                ),
+            ],
+            serde_json::to_vec(&narinfo).unwrap_or_default(),
+        )
+            .into_response())
     } else {
+        let url_header = String::from_utf8_lossy(&narinfo.url).to_string();
         let res = format_narinfo_txt(&narinfo);
-        Ok(HttpResponse::Ok()
-            .insert_header((http::header::CONTENT_TYPE, "text/x-nix-narinfo"))
-            .insert_header(("Nix-Link", narinfo.url))
-            .insert_header(cache_control_max_age_1d())
-            .body(res))
+        Ok((
+            StatusCode::OK,
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "text/x-nix-narinfo".to_string(),
+                ),
+                ("Nix-Link".parse().unwrap(), url_header),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    cache_control_max_age_1d(),
+                ),
+            ],
+            res,
+        )
+            .into_response())
     }
 }
 

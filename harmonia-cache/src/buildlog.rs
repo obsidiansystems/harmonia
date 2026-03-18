@@ -1,9 +1,9 @@
 use crate::error::{BuildLogError, CacheError, IoErrorContext, Result};
-use actix_files::NamedFile;
-use actix_web::Responder;
-use actix_web::http::header::HeaderValue;
-use actix_web::{HttpRequest, HttpResponse, http, web};
 use async_compression::tokio::bufread::BzDecoder;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use harmonia_store_core::store_path::StorePath;
 use harmonia_store_remote::DaemonStore;
 use std::ffi::OsStr;
@@ -13,11 +13,10 @@ use std::path::PathBuf;
 use tokio::io::BufReader;
 use tokio_util::io::ReaderStream;
 
-use crate::config::Config;
-use crate::{cache_control_max_age_1y, cache_control_no_store, nixhash, some_or_404};
+use crate::{AppState, cache_control_max_age_1y, cache_control_no_store, nixhash, some_or_404};
 
-async fn query_drv_path(settings: &web::Data<Config>, drv: &[u8]) -> Result<Option<StorePath>> {
-    nixhash(settings, if drv.len() > 32 { &drv[0..32] } else { drv }).await
+async fn query_drv_path(state: &AppState, drv: &[u8]) -> Result<Option<StorePath>> {
+    nixhash(state, if drv.len() > 32 { &drv[0..32] } else { drv }).await
 }
 
 pub fn get_build_log(store: &Path, drv_path: &StorePath) -> Option<PathBuf> {
@@ -45,44 +44,49 @@ pub fn get_build_log(store: &Path, drv_path: &StorePath) -> Option<PathBuf> {
 }
 
 pub(crate) async fn get(
-    drv: web::Path<String>,
-    req: HttpRequest,
-    settings: web::Data<Config>,
+    State(state): State<AppState>,
+    axum::extract::Path(drv): axum::extract::Path<String>,
+    headers: HeaderMap,
 ) -> crate::ServerResult {
-    let drv_path = some_or_404!(
-        query_drv_path(&settings, drv.as_bytes())
-            .await
-            .map_err(|e| CacheError::from(BuildLogError::QueryFailed {
+    let drv_path =
+        some_or_404!(query_drv_path(&state, drv.as_bytes()).await.map_err(
+            |e| CacheError::from(BuildLogError::QueryFailed {
                 reason: format!("Could not query nar hash in database for {drv}: {e}"),
-            }))?
-    );
-    let mut guard = settings.store.acquire().await?;
+            })
+        )?);
+    let mut guard = state.config.store.acquire().await?;
 
     match guard.client().is_valid_path(&drv_path).await {
         Ok(true) => (),
         Ok(false) => {
-            return Ok(HttpResponse::NotFound()
-                .insert_header(cache_control_no_store())
-                .finish());
+            return Ok((
+                StatusCode::NOT_FOUND,
+                [(header::CACHE_CONTROL, cache_control_no_store())],
+            )
+                .into_response());
         }
         Err(e) => {
-            return Ok(HttpResponse::InternalServerError()
-                .insert_header(cache_control_no_store())
-                .body(format!("Failed to query path info: {e}")));
+            return Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CACHE_CONTROL, cache_control_no_store())],
+                format!("Failed to query path info: {e}"),
+            )
+                .into_response());
         }
     }
-    let build_log = some_or_404!(get_build_log(settings.store.real_store(), &drv_path));
+    let build_log = some_or_404!(get_build_log(state.config.store.real_store(), &drv_path));
     let ext = match build_log.extension() {
         Some(ext) => ext,
         None => {
-            return Ok(HttpResponse::NotFound()
-                .insert_header(cache_control_no_store())
-                .finish());
+            return Ok((
+                StatusCode::NOT_FOUND,
+                [(header::CACHE_CONTROL, cache_control_no_store())],
+            )
+                .into_response());
         }
     };
-    let accept_encoding = req
-        .headers()
-        .get(http::header::ACCEPT_ENCODING)
+    let accept_encoding = headers
+        .get(header::ACCEPT_ENCODING)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
 
@@ -94,29 +98,45 @@ pub(crate) async fn get(
         let reader = BufReader::new(file);
         let decompressed_stream = BzDecoder::new(reader);
         let stream = ReaderStream::new(decompressed_stream);
-        let body = actix_web::body::BodyStream::new(stream);
 
-        return Ok(HttpResponse::Ok()
-            .insert_header(cache_control_max_age_1y())
-            .insert_header(http::header::ContentType(mime::TEXT_PLAIN_UTF_8))
-            .body(body));
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CACHE_CONTROL, cache_control_max_age_1y())
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Body::from_stream(stream))
+            .unwrap()
+            .into_response());
     }
 
     // Serve the file as-is with the appropriate Content-Encoding header
-    let log = NamedFile::open_async(&build_log)
+    let file = tokio::fs::File::open(&build_log)
         .await
-        .io_context(format!("Failed to open build log: {}", build_log.display()))?
-        .customize()
-        .insert_header(cache_control_max_age_1y());
+        .io_context(format!("Failed to open build log: {}", build_log.display()))?;
+    let metadata = file.metadata().await.io_context(format!(
+        "Failed to read build log metadata: {}",
+        build_log.display()
+    ))?;
+    let stream = ReaderStream::new(file);
 
-    let log = if ext == "bz2" {
-        log.insert_header(("Content-Encoding", HeaderValue::from_static("bzip2")))
-    } else if settings.enable_compression {
-        // don't allow compression middleware to modify partial content
-        log.insert_header(("Content-Encoding", HeaderValue::from_static("none")))
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CACHE_CONTROL, cache_control_max_age_1y())
+        .header(header::CONTENT_LENGTH, metadata.len().to_string());
+
+    if ext == "bz2" {
+        builder = builder
+            .header(header::CONTENT_ENCODING, "bzip2")
+            .header(header::CONTENT_TYPE, "application/octet-stream");
     } else {
-        log
-    };
+        builder = builder.header(header::CONTENT_TYPE, "text/plain; charset=utf-8");
+        if state.config.enable_compression {
+            // don't allow compression middleware to modify partial content
+            builder = builder.header(header::CONTENT_ENCODING, "none");
+        }
+    }
 
-    Ok(log.respond_to(&req).map_into_boxed_body())
+    Ok(builder
+        .body(Body::from_stream(stream))
+        .unwrap()
+        .into_response())
 }

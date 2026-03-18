@@ -1,21 +1,21 @@
+use crate::AppState;
 use crate::error;
-use actix_web::{
-    Error, HttpResponse,
-    dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
-    web,
-};
+use axum::extract::MatchedPath;
+use axum::extract::State;
+use axum::http::Request;
+use axum::response::{IntoResponse, Response};
 use harmonia_store_remote::PoolMetrics;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
 };
 use std::{
-    future::{Future, Ready, ready},
+    future::Future,
     pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Instant,
 };
-
-type LocalBoxFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
+use tower::{Layer, Service};
 
 pub struct PrometheusMetrics {
     pub registry: Registry,
@@ -66,66 +66,62 @@ impl PrometheusMetrics {
     }
 }
 
-pub struct PrometheusMiddleware {
+#[derive(Clone)]
+pub struct PrometheusLayer {
     metrics: Arc<PrometheusMetrics>,
 }
 
-impl PrometheusMiddleware {
+impl PrometheusLayer {
     pub fn new(metrics: Arc<PrometheusMetrics>) -> Self {
-        PrometheusMiddleware { metrics }
+        PrometheusLayer { metrics }
     }
 }
 
-impl<S, B> Transform<S, ServiceRequest> for PrometheusMiddleware
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
-    S::Future: 'static,
-    B: 'static,
-{
-    type Response = ServiceResponse<B>;
-    type Error = Error;
-    type InitError = ();
-    type Transform = PrometheusMiddlewareService<S>;
-    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+impl<S> Layer<S> for PrometheusLayer {
+    type Service = PrometheusMiddleware<S>;
 
-    fn new_transform(&self, service: S) -> Self::Future {
-        ready(Ok(PrometheusMiddlewareService {
-            service,
+    fn layer(&self, inner: S) -> Self::Service {
+        PrometheusMiddleware {
+            inner,
             metrics: self.metrics.clone(),
-        }))
+        }
     }
 }
 
-pub struct PrometheusMiddlewareService<S> {
-    service: S,
+#[derive(Clone)]
+pub struct PrometheusMiddleware<S> {
+    inner: S,
     metrics: Arc<PrometheusMetrics>,
 }
 
-impl<S, B> Service<ServiceRequest> for PrometheusMiddlewareService<S>
+impl<S, B> Service<Request<B>> for PrometheusMiddleware<S>
 where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
-    S::Future: 'static,
-    B: 'static,
+    S: Service<Request<B>, Response = Response> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
 {
-    type Response = ServiceResponse<B>;
-    type Error = Error;
-    type Future = LocalBoxFuture<Result<Self::Response, Self::Error>>;
+    type Response = Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, S::Error>> + Send>>;
 
-    forward_ready!(service);
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
 
-    fn call(&self, req: ServiceRequest) -> Self::Future {
+    fn call(&mut self, req: Request<B>) -> Self::Future {
         let start = Instant::now();
         let method = req.method().to_string();
-        // Only track metrics for paths with a match pattern
-        let path = req.match_pattern().map(|p| p.to_string());
+        let path = req
+            .extensions()
+            .get::<MatchedPath>()
+            .map(|p| p.as_str().to_string());
         let metrics = self.metrics.clone();
 
-        let fut = self.service.call(req);
+        let fut = self.inner.call(req);
 
         Box::pin(async move {
             let res = fut.await?;
 
-            // Only record metrics if we have a match pattern
             if let Some(path) = path {
                 let duration = start.elapsed().as_secs_f64();
                 let status = res.status().as_str().to_owned();
@@ -146,13 +142,15 @@ where
     }
 }
 
-pub async fn metrics_handler(
-    metrics: web::Data<Arc<PrometheusMetrics>>,
-) -> actix_web::Result<HttpResponse> {
-    let body = metrics.render();
-    Ok(HttpResponse::Ok()
-        .content_type("text/plain; version=0.0.4")
-        .body(body))
+pub async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let body = state.metrics.render();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
 }
 
 pub fn initialize_metrics()

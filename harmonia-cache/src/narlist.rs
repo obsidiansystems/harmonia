@@ -1,13 +1,14 @@
 use crate::ServerResult;
 use crate::error::{CacheError, IoErrorContext, NarInfoError, Result, ServeError};
-use actix_web::{HttpResponse, http, web};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use std::fs::Metadata;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use crate::config::Config;
-use crate::{cache_control_max_age_1y, nixhash, some_or_404};
+use crate::{AppState, cache_control_max_age_1y, nixhash, some_or_404};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -163,25 +164,39 @@ async fn get_nar_list(path: PathBuf) -> Result<NarList> {
     Ok(NarList { version: 1, root })
 }
 
-pub(crate) async fn get(hash: web::Path<String>, settings: web::Data<Config>) -> ServerResult {
+pub(crate) async fn get(
+    State(state): State<AppState>,
+    axum::extract::Path(hash): axum::extract::Path<String>,
+) -> ServerResult {
     let store_path =
         some_or_404!(
-            nixhash(&settings, hash.as_bytes())
+            nixhash(&state, hash.as_bytes())
                 .await
                 .map_err(|e| CacheError::from(NarInfoError::QueryFailed {
                     reason: format!("Could not query nar hash in database: {e}"),
                 }))?
         );
 
-    let nar_list = get_nar_list(settings.store.get_real_path(&store_path)).await?;
-    Ok(HttpResponse::Ok()
-        .insert_header(cache_control_max_age_1y())
-        .insert_header(http::header::ContentType(mime::APPLICATION_JSON))
-        .body(serde_json::to_string(&nar_list).map_err(|e| {
+    let nar_list = get_nar_list(state.config.store.get_real_path(&store_path)).await?;
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CACHE_CONTROL,
+                cache_control_max_age_1y(),
+            ),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            ),
+        ],
+        serde_json::to_string(&nar_list).map_err(|e| {
             CacheError::from(ServeError::ServeFailed {
                 source: std::io::Error::other(e),
             })
-        })?))
+        })?,
+    )
+        .into_response())
 }
 
 #[cfg(test)]

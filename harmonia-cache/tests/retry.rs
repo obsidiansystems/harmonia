@@ -53,50 +53,57 @@ async fn proxy_connection(mut client: TcpStream, upstream_port: u16, limit: usiz
     let Ok(mut upstream) = TcpStream::connect(format!("127.0.0.1:{upstream_port}")).await else {
         return;
     };
+
+    // Bidirectional copy with a byte limit on the upstream→client direction.
+    // This properly handles HTTP keep-alive since we don't interpret the
+    // HTTP protocol — we just forward bytes in both directions.
     let (mut client_read, mut client_write) = client.split();
     let (mut upstream_read, mut upstream_write) = upstream.split();
 
-    // Forward HTTP request
-    let mut buf = vec![0u8; 8192];
-    let mut req = Vec::new();
-    loop {
-        let Ok(n) = client_read.read(&mut buf).await else {
-            return;
-        };
-        if n == 0 {
-            return;
+    let client_to_upstream = async {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = match client_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if upstream_write.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+            let _ = upstream_write.flush().await;
         }
-        req.extend_from_slice(&buf[..n]);
-        let _ = upstream_write.write_all(&buf[..n]).await;
-        if req.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-    }
-    let _ = upstream_write.flush().await;
+    };
 
-    // Forward response up to limit
-    let mut sent = 0;
-    loop {
-        let Ok(n) = upstream_read.read(&mut buf).await else {
-            return;
-        };
-        if n == 0 {
-            break;
+    let upstream_to_client = async {
+        let mut buf = vec![0u8; 8192];
+        let mut sent = 0usize;
+        loop {
+            let n = match upstream_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let to_send = n.min(limit.saturating_sub(sent));
+            if to_send == 0 {
+                break;
+            }
+            if client_write.write_all(&buf[..to_send]).await.is_err() {
+                break;
+            }
+            sent += to_send;
+            if sent >= limit {
+                break;
+            }
         }
-        let to_send = n.min(limit.saturating_sub(sent));
-        if to_send == 0 {
-            break;
-        }
-        let _ = client_write.write_all(&buf[..to_send]).await;
-        sent += to_send;
-        if sent >= limit {
-            break;
-        }
+    };
+
+    tokio::select! {
+        _ = client_to_upstream => {},
+        _ = upstream_to_client => {},
     }
 }
 
 /// Test download retry over flaky connection using nix's download-attempts.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_download_retry_over_flaky_connection() -> Result<()> {
     let temp = CanonicalTempDir::new()?;
     let store_dir = temp.path().join("store");
@@ -160,7 +167,7 @@ async fn test_download_retry_over_flaky_connection() -> Result<()> {
     fs::create_dir_all(&cache_dir)?;
 
     // Copy through flaky proxy with retries
-    let output = AsyncCommand::new("nix")
+    let child = AsyncCommand::new("nix")
         .args([
             "copy",
             "--from",
@@ -183,8 +190,12 @@ async fn test_download_retry_over_flaky_connection() -> Result<()> {
         .env("XDG_CACHE_HOME", &cache_dir)
         .env_remove("NIX_USER_CONF_FILES")
         .env_remove("NIX_REMOTE")
-        .output()
-        .await?;
+        .output();
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(60), child)
+        .await
+        .map_err(|_| "nix copy timed out after 60s")?
+        .map_err(|e| format!("nix copy IO error: {e}"))?;
 
     if !output.status.success() {
         return Err(format!(

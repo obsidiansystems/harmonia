@@ -1,7 +1,5 @@
-use std::error::Error;
+use axum::response::IntoResponse;
 
-use actix_web::HttpResponse;
-
-pub(crate) async fn get() -> Result<HttpResponse, Box<dyn Error>> {
-    Ok(HttpResponse::Ok().body("OK\n"))
+pub(crate) async fn get() -> impl IntoResponse {
+    "OK\n"
 }

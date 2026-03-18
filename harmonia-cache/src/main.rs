@@ -1,15 +1,18 @@
 #![warn(clippy::dbg_macro)]
 
-use actix_web::middleware;
+use axum::Router;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
 use config::Config;
 use error::{CacheError, IoErrorContext, Result, StoreError};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::{fmt::Display, time::Duration};
+use std::sync::Arc;
 use url::Url;
 
-use actix_web::{App, HttpResponse, HttpServer, http, web};
 use harmonia_store_core::store_path::{StorePath, StorePathHash};
 use harmonia_store_remote::DaemonStore;
 
@@ -43,7 +46,13 @@ mod template;
 mod tls;
 mod version;
 
-async fn nixhash(settings: &web::Data<Config>, hash: &[u8]) -> Result<Option<StorePath>> {
+#[derive(Clone)]
+pub(crate) struct AppState {
+    config: Arc<Config>,
+    metrics: Arc<prometheus::PrometheusMetrics>,
+}
+
+async fn nixhash(state: &AppState, hash: &[u8]) -> Result<Option<StorePath>> {
     // Parse the hash bytes into a StorePathHash
     let store_path_hash =
         StorePathHash::decode_digest(hash).map_err(|e| StoreError::PathQuery {
@@ -51,7 +60,7 @@ async fn nixhash(settings: &web::Data<Config>, hash: &[u8]) -> Result<Option<Sto
             reason: format!("Invalid hash format: {e}"),
         })?;
 
-    let mut guard = settings.store.acquire().await?;
+    let mut guard = state.config.store.acquire().await?;
 
     guard
         .client()
@@ -72,20 +81,20 @@ const CARGO_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CARGO_HOME_PAGE: &str = env!("CARGO_PKG_HOMEPAGE");
 const NIXBASE32_ALPHABET: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 
-fn cache_control_max_age(max_age: u32) -> http::header::CacheControl {
-    http::header::CacheControl(vec![http::header::CacheDirective::MaxAge(max_age)])
+fn cache_control_max_age(max_age: u32) -> String {
+    format!("max-age={max_age}")
 }
 
-fn cache_control_max_age_1y() -> http::header::CacheControl {
+fn cache_control_max_age_1y() -> String {
     cache_control_max_age(365 * 24 * 60 * 60)
 }
 
-fn cache_control_max_age_1d() -> http::header::CacheControl {
+fn cache_control_max_age_1d() -> String {
     cache_control_max_age(24 * 60 * 60)
 }
 
-fn cache_control_no_store() -> http::header::CacheControl {
-    http::header::CacheControl(vec![http::header::CacheDirective::NoStore])
+fn cache_control_no_store() -> &'static str {
+    "no-store"
 }
 
 macro_rules! some_or_404 {
@@ -93,9 +102,15 @@ macro_rules! some_or_404 {
         match $res {
             Some(val) => val,
             None => {
-                return Ok(HttpResponse::NotFound()
-                    .insert_header(crate::cache_control_no_store())
-                    .body("missed hash"))
+                return Ok((
+                    StatusCode::NOT_FOUND,
+                    [(
+                        axum::http::header::CACHE_CONTROL,
+                        crate::cache_control_no_store(),
+                    )],
+                    "missed hash",
+                )
+                    .into_response())
             }
         }
     };
@@ -107,24 +122,19 @@ struct ServerError {
     err: CacheError,
 }
 
-impl Display for ServerError {
+impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.err)
     }
 }
 
-impl actix_web::error::ResponseError for ServerError {
-    fn status_code(&self) -> actix_web::http::StatusCode {
-        use actix_web::http::StatusCode;
-        match &self.err {
-            CacheError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
+impl IntoResponse for ServerError {
+    fn into_response(self) -> Response {
+        let status = match &self.err {
             CacheError::Store(StoreError::PathQuery { .. }) => StatusCode::NOT_FOUND,
-            CacheError::Signing(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            CacheError::Serve(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            CacheError::BuildLog(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            CacheError::NarInfo(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
-        }
+        };
+        (status, self.err.to_string()).into_response()
     }
 }
 
@@ -134,7 +144,24 @@ impl From<CacheError> for ServerError {
     }
 }
 
-type ServerResult = std::result::Result<HttpResponse, ServerError>;
+type ServerResult = std::result::Result<Response, ServerError>;
+
+/// Dispatch handler for `/:file` — routes `{hash}.narinfo` and `{hash}.ls`
+async fn dotfile_dispatch(
+    State(state): State<AppState>,
+    axum::extract::Path(file): axum::extract::Path<String>,
+    req: axum::extract::Request,
+) -> ServerResult {
+    if let Some(hash) = file.strip_suffix(".narinfo") {
+        let uri = req.uri().clone();
+        let query = uri.query().map(|q| q.to_string());
+        narinfo::get(State(state), axum::extract::Path(hash.to_string()), query).await
+    } else if let Some(hash) = file.strip_suffix(".ls") {
+        narlist::get(State(state), axum::extract::Path(hash.to_string())).await
+    } else {
+        Ok((StatusCode::NOT_FOUND, "not found").into_response())
+    }
+}
 
 async fn inner_main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -142,51 +169,44 @@ async fn inner_main() -> Result<()> {
     let (metrics, pool_metrics) = prometheus::initialize_metrics()?;
     let config = config::load(Some(pool_metrics))?;
 
-    let c = web::Data::new(config);
-    let config_data = c.clone();
-    let metrics_data = web::Data::new(metrics.clone());
+    let bind = config.bind.clone();
+    let enable_compression = config.enable_compression;
+    let tls_cert_path = config.tls_cert_path.clone();
+    let tls_key_path = config.tls_key_path.clone();
 
-    log::info!("listening on {}", c.bind);
-    let mut server = HttpServer::new(move || {
-        App::new()
-                .wrap(middleware::Condition::new(config_data.enable_compression, middleware::Compress::default()))
-                .wrap(prometheus::PrometheusMiddleware::new(metrics.clone()))
-                .app_data(config_data.clone())
-                .app_data(metrics_data.clone())
-                .route("/", web::get().to(root::get))
-                .route("/{hash}.ls", web::get().to(narlist::get))
-                .route("/{hash}.ls", web::head().to(narlist::get))
-                .route("/{hash}.narinfo", web::get().to(narinfo::get))
-                .route("/{hash}.narinfo", web::head().to(narinfo::get))
-                .route(
-                    &format!("/nar/{{narhash:[{NIXBASE32_ALPHABET}]{{52}}}}.nar"),
-                    web::get().to(nar::get),
-                )
-                .route(
-                    // narinfos served by nix-serve have the narhash embedded in the nar URL.
-                    // While we don't do that, if nix-serve is replaced with harmonia, the old nar URLs
-                    // will stay in client caches for a while - so support them anyway.
-                    &format!(
-                        "/nar/{{outhash:[{NIXBASE32_ALPHABET}]{{32}}}}-{{narhash:[{NIXBASE32_ALPHABET}]{{52}}}}.nar"
-                    ),
-                    web::get().to(nar::get),
-                )
-                .route("/serve/{hash}{path:.*}", web::get().to(serve::get))
-                .route("/log/{drv}", web::get().to(buildlog::get))
-                .route("/version", web::get().to(version::get))
-                .route("/health", web::get().to(health::get))
-                .route("/nix-cache-info", web::get().to(cacheinfo::get))
-                .route("/metrics", web::get().to(prometheus::metrics_handler))
-        })
-        // default is 5 seconds, which is too small when doing mass requests on slow machines
-        .client_request_timeout(Duration::from_secs(30))
-    .workers(c.workers)
-    .max_connection_rate(c.max_connection_rate);
+    let state = AppState {
+        config: Arc::new(config),
+        metrics,
+    };
 
-    let try_url = Url::parse(&c.bind);
-    let (bind, uds) = if let Ok(url) = try_url.as_ref() {
+    let router = Router::new()
+        .route("/", get(root::get))
+        .route("/{file}", get(dotfile_dispatch).head(dotfile_dispatch))
+        .route("/nar/{file}", get(nar::get))
+        .route("/serve/{hash}", get(serve::get_root))
+        .route("/serve/{hash}/", get(serve::get_root))
+        .route("/serve/{hash}/{*path}", get(serve::get))
+        .route("/log/{drv}", get(buildlog::get))
+        .route("/version", get(version::get))
+        .route("/health", get(health::get))
+        .route("/nix-cache-info", get(cacheinfo::get))
+        .route("/metrics", get(prometheus::metrics_handler))
+        .with_state(state.clone());
+
+    let router = router.layer(prometheus::PrometheusLayer::new(state.metrics.clone()));
+
+    let app = if enable_compression {
+        router.layer(tower_http::compression::CompressionLayer::new().zstd(true))
+    } else {
+        router
+    };
+
+    log::info!("listening on {}", bind);
+
+    let try_url = Url::parse(&bind);
+    let (bind_addr, uds) = if let Ok(url) = try_url.as_ref() {
         if url.scheme() != "unix" {
-            (c.bind.as_str(), false)
+            (bind.as_str(), false)
         } else if url.host().is_none() {
             (url.path(), true)
         } else {
@@ -196,52 +216,68 @@ async fn inner_main() -> Result<()> {
             .into());
         }
     } else {
-        (c.bind.as_str(), false)
+        (bind.as_str(), false)
     };
 
-    if c.tls_cert_path.is_some() || c.tls_key_path.is_some() {
+    if tls_cert_path.is_some() || tls_key_path.is_some() {
         if uds {
             log::error!("TLS is not supported with Unix domain sockets.");
             std::process::exit(1);
         }
-        let config = tls::load_tls_config(
+        let tls_config = tls::load_tls_config(
             Path::new(
-                &c.tls_cert_path
-                    .clone()
+                tls_cert_path
+                    .as_ref()
                     .expect("tls certificate path must be set when tls is enabled"),
             ),
             Path::new(
-                &c.tls_key_path
-                    .clone()
+                tls_key_path
+                    .as_ref()
                     .expect("tls key path must be set when tls is enabled"),
             ),
         )?;
 
-        server = server
-            .bind_rustls_0_23(c.bind.clone(), config)
-            .io_context("Failed to bind with TLS")?;
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls_config));
+        let addr: std::net::SocketAddr =
+            bind_addr.parse().map_err(|e| error::ServerError::Startup {
+                reason: format!("Invalid bind address: {e}"),
+            })?;
+        axum_server::bind_rustls(addr, rustls_config)
+            .serve(app.into_make_service())
+            .await
+            .io_context("Failed to start TLS server")?;
     } else if uds {
         if !cfg!(unix) {
             log::error!("Binding to Unix domain sockets is only supported on Unix.");
             std::process::exit(1);
         } else {
-            let socket_path = Path::new(bind);
-            server = server
-                .bind_uds(socket_path)
+            let socket_path = Path::new(bind_addr);
+            // Remove existing socket file if present
+            if socket_path.exists() {
+                fs::remove_file(socket_path).io_context("Failed to remove existing socket file")?;
+            }
+            let listener = tokio::net::UnixListener::bind(socket_path)
                 .io_context("Failed to bind to Unix domain socket")?;
             fs::set_permissions(socket_path, fs::Permissions::from_mode(0o777))
                 .io_context("Failed to set socket permissions")?;
+            axum::serve(listener, app)
+                .await
+                .io_context("Failed to start UDS server")?;
         }
     } else {
-        server = server
-            .bind(c.bind.clone())
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
             .io_context("Failed to bind server")?;
+        axum::serve(listener, app)
+            .await
+            .io_context("Failed to start server")?;
     }
 
-    server.run().await.io_context("Failed to start server")
+    Ok(())
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
     inner_main().await.map_err(std::io::Error::other)
 }

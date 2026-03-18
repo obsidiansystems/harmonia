@@ -1,20 +1,21 @@
-use std::error::Error;
+use axum::extract::State;
+use axum::response::IntoResponse;
 
-use crate::config;
-use actix_web::{HttpResponse, http, web};
+use crate::AppState;
 
-pub(crate) async fn get(config: web::Data<config::Config>) -> Result<HttpResponse, Box<dyn Error>> {
-    let priority_str = config.priority.to_string();
+pub(crate) async fn get(State(state): State<AppState>) -> impl IntoResponse {
+    let priority_str = state.config.priority.to_string();
 
     let body = crate::build_bytes!(
         b"StoreDir: ",
-        config.store.virtual_store(),
+        state.config.store.virtual_store(),
         b"\nWantMassQuery: 1\nPriority: ",
         priority_str.as_bytes(),
         b"\n"
     );
 
-    Ok(HttpResponse::Ok()
-        .insert_header((http::header::CONTENT_TYPE, "text/x-nix-cache-info"))
-        .body(body))
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/x-nix-cache-info")],
+        body,
+    )
 }

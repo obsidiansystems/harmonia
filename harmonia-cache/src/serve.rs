@@ -1,15 +1,17 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::IoErrorContext;
-use actix_files::NamedFile;
-use actix_web::Responder;
-use actix_web::{HttpRequest, HttpResponse, web};
 use askama_escape::{Html, escape as escape_html_entity};
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use percent_encoding::{CONTROLS, utf8_percent_encode};
+use tokio_util::io::ReaderStream;
 
 use crate::template::{DIRECTORY_ROW_TEMPLATE, DIRECTORY_TEMPLATE, render, render_page};
 use crate::{
-    CARGO_NAME, CARGO_VERSION, ServerResult, TAILWIND_CSS, config::Config, nixhash, some_or_404,
+    AppState, CARGO_NAME, CARGO_VERSION, ServerResult, TAILWIND_CSS, nixhash, some_or_404,
 };
 
 /// Returns percent encoded file URL path.
@@ -103,21 +105,52 @@ pub(crate) fn directory_listing(
         &content,
     );
 
-    Ok(HttpResponse::Ok()
-        .content_type("text/html; charset=utf-8")
-        .body(html))
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response())
+}
+
+fn guess_mime(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("html") | Some("htm") => "text/html",
+        Some("css") => "text/css",
+        Some("js") => "application/javascript",
+        Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("txt") => "text/plain",
+        Some("xml") => "application/xml",
+        Some("wasm") => "application/wasm",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+pub(crate) async fn get_root(
+    State(state): State<AppState>,
+    axum::extract::Path(hash): axum::extract::Path<String>,
+) -> ServerResult {
+    get_inner(state, &hash, "").await
 }
 
 pub(crate) async fn get(
-    path: web::Path<(String, PathBuf)>,
-    req: HttpRequest,
-    settings: web::Data<Config>,
+    State(state): State<AppState>,
+    axum::extract::Path((hash, path)): axum::extract::Path<(String, String)>,
 ) -> ServerResult {
-    let (hash, dir) = path.into_inner();
-    let dir = dir.strip_prefix("/").unwrap_or(&dir);
+    get_inner(state, &hash, &path).await
+}
 
-    let store_path_obj = some_or_404!(nixhash(&settings, hash.as_bytes()).await?);
-    let store_path = settings.store.get_real_path(&store_path_obj);
+async fn get_inner(state: AppState, hash: &str, sub_path: &str) -> ServerResult {
+    let dir = Path::new(sub_path);
+    let dir = dir.strip_prefix("/").unwrap_or(dir);
+
+    let store_path_obj = some_or_404!(nixhash(&state, hash.as_bytes()).await?);
+    let store_path = state.config.store.get_real_path(&store_path_obj);
     let full_path = if dir == Path::new("") {
         store_path.clone()
     } else {
@@ -128,29 +161,27 @@ pub(crate) async fn get(
         full_path.display()
     ))?;
 
-    let real_store = settings
+    let real_store = state
+        .config
         .store
         .real_store()
         .canonicalize()
         .io_context(format!(
             "cannot resolve real nix store path: {}",
-            settings.store.real_store().display()
+            state.config.store.real_store().display()
         ))?;
 
     if !full_path.starts_with(&real_store) {
-        return Ok(HttpResponse::NotFound().finish());
+        return Ok(StatusCode::NOT_FOUND.into_response());
     }
 
     if full_path.is_dir() {
         let index_file = full_path.join("index.html");
         if index_file.metadata().is_ok_and(|stat| stat.is_file()) {
-            return Ok(NamedFile::open_async(&index_file)
-                .await
-                .io_context(format!("cannot open {}", index_file.display()))?
-                .respond_to(&req));
+            return serve_file(&index_file).await;
         }
 
-        let url_prefix = PathBuf::from("/serve").join(&hash);
+        let url_prefix = PathBuf::from("/serve").join(hash);
         let url_prefix = if dir == Path::new("") {
             url_prefix
         } else {
@@ -158,9 +189,26 @@ pub(crate) async fn get(
         };
         directory_listing(&url_prefix, &full_path, &real_store)
     } else {
-        Ok(NamedFile::open_async(&full_path)
-            .await
-            .io_context(format!("cannot open file: {}", full_path.display()))?
-            .respond_to(&req))
+        serve_file(&full_path).await
     }
+}
+
+async fn serve_file(path: &Path) -> ServerResult {
+    let file = tokio::fs::File::open(path)
+        .await
+        .io_context(format!("cannot open file: {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .await
+        .io_context(format!("cannot read file metadata: {}", path.display()))?;
+    let content_type = guess_mime(path);
+    let stream = ReaderStream::new(file);
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, metadata.len().to_string())
+        .body(Body::from_stream(stream))
+        .unwrap()
+        .into_response())
 }

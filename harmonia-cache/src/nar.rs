@@ -1,25 +1,50 @@
-use crate::config::Config;
 use crate::error::{CacheError, StoreError};
-use crate::{cache_control_max_age_1y, some_or_404};
-use actix_web::web::Bytes;
-use actix_web::{HttpRequest, HttpResponse, http, web};
+use crate::{AppState, cache_control_max_age_1y};
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use harmonia_nar::NarByteStream;
 use harmonia_store_core::store_path::StorePathHash;
 use harmonia_store_remote::DaemonStore;
 use harmonia_utils_hash::fmt::CommonHash;
+use http_body::SizeHint;
 use serde::Deserialize;
+
+// A body wrapper that reports a known content length to hyper,
+// ensuring Content-Length header is sent instead of chunked encoding.
+pin_project_lite::pin_project! {
+    struct SizedBody {
+        #[pin]
+        inner: Body,
+        size: u64,
+    }
+}
+
+impl http_body::Body for SizedBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.project().inner.poll_frame(cx)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.size)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
 
 /// Represents the query string of a NAR URL.
 #[derive(Debug, Deserialize)]
 pub struct NarRequest {
     hash: Option<String>,
-}
-
-/// Represents the parsed parts in a NAR URL.
-#[derive(Debug, Deserialize)]
-pub struct PathParams {
-    narhash: String,
-    outhash: Option<String>,
 }
 
 // TODO(conni2461): still missing
@@ -53,14 +78,47 @@ impl HttpRange {
     }
 }
 
+/// Parse a NAR filename into (narhash, optional outhash).
+/// Supports:
+///   - `{narhash}.nar` (52-char nixbase32 hash)
+///   - `{outhash}-{narhash}.nar` (32-char outhash + 52-char narhash)
+fn parse_nar_filename(file: &str) -> Option<(String, Option<String>)> {
+    let name = file.strip_suffix(".nar")?;
+
+    if name.len() == 52 && name.chars().all(|c| crate::NIXBASE32_ALPHABET.contains(c)) {
+        return Some((name.to_string(), None));
+    }
+
+    if name.len() == 85 {
+        let (outhash, rest) = name.split_at(32);
+        let narhash = rest.strip_prefix('-')?;
+        if narhash.len() == 52
+            && outhash
+                .chars()
+                .all(|c| crate::NIXBASE32_ALPHABET.contains(c))
+            && narhash
+                .chars()
+                .all(|c| crate::NIXBASE32_ALPHABET.contains(c))
+        {
+            return Some((narhash.to_string(), Some(outhash.to_string())));
+        }
+    }
+
+    None
+}
+
 pub(crate) async fn get(
-    path: web::Path<PathParams>,
-    req: HttpRequest,
-    q: web::Query<NarRequest>,
-    settings: web::Data<Config>,
+    State(state): State<AppState>,
+    axum::extract::Path(file): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<NarRequest>,
+    headers: HeaderMap,
 ) -> crate::ServerResult {
-    // Extract the narhash from the query parameter, and bail out if it's missing or invalid.
-    let narhash = some_or_404!(Some(path.narhash.as_str()));
+    let (narhash, path_outhash) = match parse_nar_filename(&file) {
+        Some(parsed) => parsed,
+        None => {
+            return Ok((StatusCode::NOT_FOUND, "invalid nar filename").into_response());
+        }
+    };
 
     // lookup the store path.
     // We usually extract the outhash from the query parameter.
@@ -69,7 +127,7 @@ pub(crate) async fn get(
     let outhash = if let Some(outhash) = &q.hash {
         Some(outhash.as_str())
     } else {
-        path.outhash.as_deref()
+        path_outhash.as_deref()
     };
     let store_path = match outhash {
         Some(outhash) => {
@@ -82,7 +140,7 @@ pub(crate) async fn get(
                     })
                 })?;
 
-            let mut guard = settings.store.acquire().await?;
+            let mut guard = state.config.store.acquire().await?;
             guard
                 .client()
                 .query_path_from_hash_part(&store_path_hash)
@@ -95,23 +153,29 @@ pub(crate) async fn get(
                 })?
         }
         None => {
-            return Ok(HttpResponse::NotFound()
-                .insert_header(crate::cache_control_no_store())
-                .body("missing outhash"));
+            return Ok((
+                StatusCode::NOT_FOUND,
+                [(header::CACHE_CONTROL, crate::cache_control_no_store())],
+                "missing outhash",
+            )
+                .into_response());
         }
     };
     let store_path = match store_path {
         Some(store_path) => store_path,
         None => {
-            return Ok(HttpResponse::NotFound()
-                .insert_header(crate::cache_control_no_store())
-                .body("store path not found"));
+            return Ok((
+                StatusCode::NOT_FOUND,
+                [(header::CACHE_CONTROL, crate::cache_control_no_store())],
+                "store path not found",
+            )
+                .into_response());
         }
     };
 
     // lookup the path info.
     let info = {
-        let mut guard = settings.store.acquire().await?;
+        let mut guard = state.config.store.acquire().await?;
 
         match guard
             .client()
@@ -121,9 +185,12 @@ pub(crate) async fn get(
         {
             Some(info) => info,
             None => {
-                return Ok(HttpResponse::NotFound()
-                    .insert_header(crate::cache_control_no_store())
-                    .body("path info not found"));
+                return Ok((
+                    StatusCode::NOT_FOUND,
+                    [(header::CACHE_CONTROL, crate::cache_control_no_store())],
+                    "path info not found",
+                )
+                    .into_response());
             }
         }
     }; // guard is dropped here
@@ -131,70 +198,81 @@ pub(crate) async fn get(
     // URL narhash is bare (no sha256: prefix), so use as_bare() for comparison
     let expected_hash = info.nar_hash.as_base32().as_bare().to_string();
     if narhash != expected_hash {
-        return Ok(HttpResponse::NotFound()
-            .insert_header(crate::cache_control_no_store())
-            .body("hash mismatch detected"));
+        return Ok((
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, crate::cache_control_no_store())],
+            "hash mismatch detected",
+        )
+            .into_response());
     }
 
     let rlength = info.nar_size;
-    let mut res = HttpResponse::Ok();
-
-    let real_path = settings.store.get_real_path(&store_path);
+    let real_path = state.config.store.get_real_path(&store_path);
 
     // Credit actix_web actix-files: https://github.com/actix/actix-web/blob/master/actix-files/src/named.rs#L525
-    if let Some(ranges) = req.headers().get(http::header::RANGE) {
+    if let Some(ranges) = headers.get(header::RANGE) {
         if let Ok(ranges_header) = ranges.to_str() {
             if let Ok(ranges) = HttpRange::parse(ranges_header, rlength) {
                 let range_length = ranges[0].length;
                 let offset = ranges[0].start;
 
-                if settings.enable_compression {
-                    // don't allow compression middleware to modify partial content
-                    res.insert_header((
-                        http::header::CONTENT_ENCODING,
-                        http::header::HeaderValue::from_static("none"),
-                    ));
-                }
-
-                res.insert_header((
-                    http::header::CONTENT_RANGE,
-                    format!(
-                        "bytes {}-{}/{}",
-                        offset,
-                        offset + range_length - 1,
-                        info.nar_size
-                    ),
-                ));
-
-                // For range requests, we need to skip bytes and limit output
                 let stream = NarByteStream::new(real_path);
                 let ranged_stream = create_range_stream(stream, offset, range_length);
 
-                return Ok(res
-                    .insert_header((http::header::CONTENT_TYPE, "application/x-nix-archive"))
-                    .insert_header((http::header::ACCEPT_RANGES, "bytes"))
-                    .insert_header(cache_control_max_age_1y())
-                    .body(actix_web::body::SizedStream::new(
-                        range_length,
-                        ranged_stream,
-                    )));
+                let mut builder = Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, "application/x-nix-archive")
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_LENGTH, range_length.to_string())
+                    .header(
+                        header::CONTENT_RANGE,
+                        format!(
+                            "bytes {}-{}/{}",
+                            offset,
+                            offset + range_length - 1,
+                            info.nar_size
+                        ),
+                    )
+                    .header(header::CACHE_CONTROL, cache_control_max_age_1y());
+
+                if state.config.enable_compression {
+                    // don't allow compression middleware to modify partial content
+                    builder = builder.header(header::CONTENT_ENCODING, "none");
+                }
+
+                let sized = SizedBody {
+                    inner: Body::from_stream(ranged_stream),
+                    size: range_length,
+                };
+                return Ok(builder.body(sized).unwrap().into_response());
             } else {
-                res.insert_header((http::header::CONTENT_RANGE, format!("bytes */{rlength}")));
-                return Ok(res.status(http::StatusCode::RANGE_NOT_SATISFIABLE).finish());
+                return Ok(Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{rlength}"))
+                    .body(Body::empty())
+                    .unwrap()
+                    .into_response());
             };
         } else {
-            return Ok(res.status(http::StatusCode::BAD_REQUEST).finish());
+            return Ok(StatusCode::BAD_REQUEST.into_response());
         };
     }
 
     // Non-range request: stream the full NAR
     let stream = NarByteStream::new(real_path);
+    let sized = SizedBody {
+        inner: Body::from_stream(stream),
+        size: rlength,
+    };
 
-    Ok(res
-        .insert_header((http::header::CONTENT_TYPE, "application/x-nix-archive"))
-        .insert_header((http::header::ACCEPT_RANGES, "bytes"))
-        .insert_header(cache_control_max_age_1y())
-        .body(actix_web::body::SizedStream::new(rlength, stream)))
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-nix-archive")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, cache_control_max_age_1y())
+        .body(sized)
+        .unwrap()
+        .into_response())
 }
 
 /// Create a stream that skips `offset` bytes and returns at most `length` bytes.
@@ -202,9 +280,9 @@ fn create_range_stream<S>(
     stream: S,
     offset: u64,
     length: u64,
-) -> impl futures::Stream<Item = std::result::Result<Bytes, std::io::Error>>
+) -> impl futures::Stream<Item = std::result::Result<axum::body::Bytes, std::io::Error>>
 where
-    S: futures::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Unpin,
+    S: futures::Stream<Item = std::result::Result<axum::body::Bytes, std::io::Error>> + Unpin,
 {
     futures::stream::unfold(
         (stream, offset, length, 0u64),
@@ -214,6 +292,7 @@ where
             loop {
                 match stream.next().await {
                     Some(Ok(data)) => {
+                        let data: axum::body::Bytes = data;
                         let data_len = data.len() as u64;
 
                         // If we haven't reached the offset yet
