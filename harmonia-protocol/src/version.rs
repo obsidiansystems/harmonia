@@ -6,7 +6,7 @@ use std::{
     str::FromStr,
 };
 
-use serde_with::{DeserializeFromStr, SerializeDisplay};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
 use harmonia_protocol_derive::{NixDeserialize, NixSerialize};
@@ -19,18 +19,7 @@ pub const PROTOCOL_VERSION_MIN: ProtocolVersion =
     ProtocolVersion::from_parts(PROTOCOL_VERSION_MAJOR, 37);
 
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    DeserializeFromStr,
-    SerializeDisplay,
-    NixDeserialize,
-    NixSerialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, NixDeserialize, NixSerialize,
 )]
 #[nix(from = "u16", into = "u16")]
 pub struct ProtocolVersion(u8, u8);
@@ -63,6 +52,19 @@ impl ProtocolVersion {
 
     pub const fn previous(&self) -> ProtocolVersion {
         ProtocolVersion(self.0, self.1 - 1)
+    }
+}
+
+impl Serialize for ProtocolVersion {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProtocolVersion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(de::Error::custom)
     }
 }
 
@@ -130,7 +132,7 @@ impl FromStr for ProtocolVersion {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ProtocolRange {
     Full,
     To(ProtocolVersion),
@@ -292,6 +294,19 @@ impl From<RangeInclusive<u8>> for ProtocolRange {
             ProtocolVersion(PROTOCOL_VERSION_MAJOR, *value.start()),
             ProtocolVersion(PROTOCOL_VERSION_MAJOR, *value.end()).next(),
         )
+    }
+}
+
+impl Serialize for ProtocolRange {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProtocolRange {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(de::Error::custom)
     }
 }
 

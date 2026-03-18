@@ -2,7 +2,7 @@ use harmonia_daemon::config::Config;
 use harmonia_daemon::error::{DaemonError, IoContext};
 use harmonia_daemon::handler::LocalStoreHandler;
 use harmonia_daemon::server::DaemonServer;
-use log::{error, info};
+use tracing::{error, info};
 use std::path::PathBuf;
 use tokio::signal;
 
